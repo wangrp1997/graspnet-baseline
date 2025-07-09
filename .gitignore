@@ -14,3 +14,11 @@
 **/*.egg-info/**
 logs
 dataset/tolerance
+.cache/
+checkpoints/
+dataset/tolerance.tar
+demo_oak.py
+doc/my_data/
+graspnetAPI/
+main.py
+oak/
