@@ -130,39 +130,66 @@ def vis_grasps(gg, cloud):
             print("已退出选择。")
             break
 
-    # === 新增：eye-to-hand变换 ===
-    import numpy as np
+    # === 新增：eye-to-hand变换（与YOLO代码一致） ===
     try:
-        H = np.load('eye-to-hand-transform.npy')
+        # 使用验证函数加载H矩阵
+        T_eye_to_base = load_and_assert_transform_matrix('eye-to-hand-transform.npy')
+        
         # 单个抓取点
-        translation = best_gg.translations[0]
-        rotation_matrix = best_gg.rotation_matrices[0]
-        # 只对H的平移部分做单位转换
-        if np.max(np.abs(H[:3, 3])) > 10:  # 如果大于10，说明是毫米
-            H[:3, 3] = H[:3, 3] / 1000
-        translation_homo = np.append(translation, 1)
-        translation_robot = H @ translation_homo
-        print('机械臂基坐标系下的位置（米）:', translation_robot[:3])
-        R_robot = H[:3, :3] @ rotation_matrix
+        translation = best_gg.translations[0]  # 相机坐标系下的位置
+        rotation_matrix = best_gg.rotation_matrices[0]  # 相机坐标系下的旋转矩阵
+        
+        # === 坐标系修正（在eye-to-hand变换之前） ===
+        # [0,0,1;1,0,0;0,1,0]
+        correction_matrix = np.array([
+            [0, 0, 1],  # GraspNet y轴 → 相机x轴
+            [1, 0, 0],  # GraspNet z轴 → 相机y轴
+            [0, 1, 0]   # GraspNet x轴 → 相机z轴
+        ])
+        A = np.diag([-1, -1, 1])  # 末端姿态修正矩阵
+        # 对旋转矩阵进行修正
+        rotation_matrix_corrected =  rotation_matrix@correction_matrix
+
+        # 2. 构建完整的齐次变换矩阵
+        grasp_transform = np.eye(4)
+        grasp_transform[:3, :3] = rotation_matrix_corrected  # 旋转部分
+        grasp_transform[:3, 3] = translation  # 平移部分
+        
+        # if np.max(np.abs(T_eye_to_base[:3, 3])) > 10:  # 如果大于10，说明是毫米
+        T_eye_to_base[:3, 3] = T_eye_to_base[:3, 3] / 1000
+        # zuo乘H，得到baselink坐标系下的变换矩阵
+        robot_transform = T_eye_to_base @ grasp_transform        
+        # 提取位置和旋转
+        R_robot = robot_transform[:3, :3]           # 旋转部分
+        translation_robot = robot_transform[:3, 3]  # 平移部分
+
+        tool_offset = np.array([0, 0, 0.28])  # 工具长度
+        tool_offset_in_base = R_robot @ tool_offset
+        tcp_target_position = translation_robot - tool_offset_in_base
+        print('机械臂基坐标系下的位置修正之qian（米）:', translation_robot)
+
+        translation_robot = A@ tcp_target_position[:3]  # 只取前3个坐标
+
+        R_robot_ = A@ R_robot[:3, :3] # 只取前3行3列
+
+
+        print('机械臂基坐标系下的位置修正之后（米）:', translation_robot)
         print('机械臂基坐标系下的旋转矩阵:\n', R_robot)
+        
         try:
             from scipy.spatial.transform import Rotation as R
-            r = R.from_matrix(R_robot)
+            r = R.from_matrix(R_robot_)
             quat_robot = r.as_quat()  # [x, y, z, w]
             print('机械臂基坐标系下的四元数 [x, y, z, w]:', quat_robot)
         except ImportError:
             print('如需四元数输出，请安装 scipy：pip install scipy')
-        # # === 工具长度补偿 ===
-        # tool_offset = np.array([0, 0, 0.28])  # 末端比TCP多出28cm
-        # tool_offset_in_base = R_robot @ tool_offset
-        # real_ee_position = translation_robot[:3] - tool_offset_in_base
-        # print('灵巧手末端补偿后的位置（米）:', real_ee_position)
+        
     except Exception as e:
         print('eye-to-hand变换失败:', e)
     # === 变换结束 ===
-    
-    # publish_pose_continuously(translation_robot, quat_robot)
-    publish_pose_continuously(translation_robot[:3])
+    # translation_robot[2] += 0.05  # 只取前3个坐标
+    publish_pose_continuously(translation_robot[:3], quat_robot)
+    # publish_pose_continuously(translation_robot[:3])
 
 def demo(data_dir):
     net = get_net()
@@ -174,12 +201,13 @@ def demo(data_dir):
 
 
 class GraspPosePublisher(Node):
-    def __init__(self, ee_target_position, frame_id='base_link', topic='/ee_target_pose', freq=10):
+    def __init__(self, ee_target_position, ee_target_quat, frame_id='base_link', topic='/ee_target_pose', freq=10):
         super().__init__('grasp_pose_publisher')
         self.publisher_ = self.create_publisher(PoseStamped, topic, 10)
         self.ee_target_position = ee_target_position  # 末端目标点
+        self.ee_target_quat = ee_target_quat  # 末端目标姿态
         self.frame_id = frame_id
-        self.tool_offset = np.array([0.05, 0, 0.28])  # 工具长度
+        self.tool_offset = np.array([0, 0, 0.28])  # 工具长度
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.timer = self.create_timer(1.0/freq, self.timer_callback)
@@ -198,37 +226,67 @@ class GraspPosePublisher(Node):
             ]
             from scipy.spatial.transform import Rotation as R
             R_current = R.from_quat(q).as_matrix()
-            # 用当前末端姿态做补偿，反推TCP目标点
-            tool_offset_in_base = R_current @ self.tool_offset
-            tcp_target_position = self.ee_target_position + tool_offset_in_base
 
+            R_target = R.from_quat(self.ee_target_quat).as_matrix()
+
+
+            # === 打印欧拉角对比 ===
+            # 当前末端欧拉角
+            euler_current = R.from_quat(q).as_euler('xyz', degrees=True)
+            print('当前末端欧拉角(度):', euler_current)
+
+            # 规划目标欧拉角
+            euler_target = R.from_quat(self.ee_target_quat).as_euler('xyz', degrees=True)
+            print('规划目标欧拉角(度):', euler_target)
+            # 角度差异
+            angle_diff = euler_target - euler_current
+            print('角度差异(度):', angle_diff)
+            print('---')
+            # === 打印结束 ===
+            
+            # 用当前末端姿态做补偿，反推TCP目标点
+            # tool_offset_in_base = R_current @ self.tool_offset
+            # tcp_target_position = self.ee_target_position - tool_offset_in_base
+            # print('规划的目标位置(m):', tcp_target_position)
             msg = PoseStamped()
             msg.header.frame_id = self.frame_id
             msg.header.stamp = self.get_clock().now().to_msg()
-            msg.pose.position.x = -float(tcp_target_position[0])
-            msg.pose.position.y = -float(tcp_target_position[1])
-            msg.pose.position.z = float(tcp_target_position[2])+0.05  # +0.05是为了避开桌面
-            # 姿态用当前末端的
-            msg.pose.orientation.x = q[0]
-            msg.pose.orientation.y = q[1]
-            msg.pose.orientation.z = q[2]
-            msg.pose.orientation.w = q[3]
+            # 1. 对位置做x、y取反
+            msg.pose.position.x = float(self.ee_target_position[0])
+            msg.pose.position.y = float(self.ee_target_position[1])
+            msg.pose.position.z = float(self.ee_target_position[2])
+
+            msg.pose.orientation.x = self.ee_target_quat[0]
+            msg.pose.orientation.y = self.ee_target_quat[1]
+            msg.pose.orientation.z = self.ee_target_quat[2]
+            msg.pose.orientation.w = self.ee_target_quat[3]
+            # msg.pose.orientation.x = q[0]
+            # msg.pose.orientation.y = q[1]
+            # msg.pose.orientation.z = q[2]
+            # msg.pose.orientation.w = q[3]
 
             self.publisher_.publish(msg)
-            self.get_logger().info('发布目标位姿（末端目标点+当前姿态）...')
+            self.get_logger().info('发布目标位姿（末端目标点+目标姿态）...')
         except Exception as e:
-            self.get_logger().warn(f'获取tf失败: {e}')
+            self.get_logger().warn(f'{e}')
 
 # 调用时只需要传位置
-def publish_pose_continuously(ee_target_position):
+def publish_pose_continuously(ee_target_position, ee_target_quat):
     rclpy.init()
-    node = GraspPosePublisher(ee_target_position)
+    node = GraspPosePublisher(ee_target_position, ee_target_quat)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     node.destroy_node()
     rclpy.shutdown()
+
+def load_and_assert_transform_matrix(npy_file: str) -> np.ndarray:
+    """加载并验证变换矩阵H"""
+    matrix = np.load(npy_file)
+    assert matrix.shape == (4, 4), f"Invalid matrix shape {matrix.shape}"
+    assert np.allclose(matrix[3, :], [0, 0, 0, 1]), "Invalid last row"
+    return matrix
 
 if __name__=='__main__':
     data_dir = 'orbbec/my_data'
