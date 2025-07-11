@@ -85,6 +85,37 @@ The pretrained weights can be downloaded from:
 ## Demo
 A demo program is provided for grasp detection and visualization using RGB-D images. You can refer to [command_demo.sh](command_demo.sh) to run the program. `--checkpoint_path` should be specified according to your settings (make sure you have downloaded the pretrained weights, we recommend the realsense model since it might transfer better). The output should be similar to the following example:
 
+demo1.py真机部署
+启动UR的ROS2驱动 在dexhand demo项目下运行 ur16e/start_up_driver.sh
+启动polyscope里面的extern control1.urp
+运行moveit的节点 运行第二条（在ur dexhand demo项目下）
+ros2 launch ur_simulation_gz ur_sim_moveit.launch.py
+ros2 launch ur_dexhand_moveit_config move_group.launch.py ur_type:=ur16e launch_rviz:=true
+然后运行这个程序进行规划和等待执行：
+ros2 run ur_control_cpp ur_realtime_control
+ros2 run ur_control_cpp ur_cartesian_control
+然后运行：
+python demo1.py --checkpoint_path ./checkpoints/checkpoint-rs.tar
+得到末端的位姿：
+ros2 run tf2_ros tf2_echo base_link wrist_3_link
+发布位置指令：
+ros2 topic pub /ee_target_pose geometry_msgs/PoseStamped "header:
+  frame_id: 'base_link'
+pose:
+  position:
+    x: 0.4
+    y: 0.4
+    z: 0.3
+  orientation:
+    x: 1.0
+    y: 0.0
+    z: 0.0
+    w: 0.0"
+
+确认轨迹正常后：
+ros2 service call /execute_plan std_srvs/srv/Trigger
+
+
 <div align="center">    
     <img src="doc/example_data/demo_result.png", width="480", alt="demo_result" />
 </div>
